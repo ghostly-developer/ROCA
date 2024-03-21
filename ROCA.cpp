@@ -285,14 +285,14 @@ void start_client(const std::string& ipAddress, int port, const std::string& use
                 std::cout << "Disconnected from server." << std::endl;
                 break;
             }
-            std::cout << std::string(buffer, 0, bytesReceived) << std::endl;
+            std::cout << std::string(buffer, 0, bytesReceived) << std::endl << "> ";
         }
         });
     t.detach();
 
     std::string input;
     while (true) {
-        std::cout << ">" << std::endl;
+        std::cout << "> ";
         std::getline(std::cin, input);
         if (!input.empty()) {
             send(sock, input.c_str(), input.size() + 1, 0);
