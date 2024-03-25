@@ -9,6 +9,8 @@
 #include <vector>
 #include <string>
 #include <windows.h>
+#include <algorithm>
+#include <cstring> 
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -21,10 +23,16 @@ bool isAltEPressed() {
     return (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(0x45) & 0x8000);
 }
 
+struct Channel {
+    std::string name;
+    std::vector<SOCKET> clients;
+};
+
 struct ServerConfig {
     std::string name;
     std::string ipAddress;
     int port;
+    std::vector<Channel> channels;
 };
 
 void broadcastMessage(const std::string& message, SOCKET excludeSock = INVALID_SOCKET) {
@@ -80,8 +88,26 @@ void editServerConfig(int index, std::vector<ServerConfig>& configs) {
         std::cin >> port;
         std::cin.ignore();
 
-        configs[index] = { name, ip, port };
-        std::cout << "Configuration updated." << std::endl;
+        std::cout << "Current channels: ";
+        for (const auto& channel : configs[index].channels) {
+            std::cout << channel.name << " ";
+        }
+        std::cout << "Enter new list of channels (comma-separated, no spaces): ";
+        std::string channelsInput;
+        std::getline(std::cin, channelsInput);
+        std::istringstream iss(channelsInput);
+        configs[index].channels.clear();  // Clear existing channels
+        std::string channelName;
+        while (getline(iss, channelName, ',')) {
+            Channel newChannel;
+            newChannel.name = channelName;
+            configs[index].channels.push_back(newChannel);  // Add new channel
+        }
+
+        // Update the server configuration
+        configs[index].name = name;
+        configs[index].ipAddress = ip;
+        configs[index].port = port;
     }
     else {
         std::cerr << "Invalid configuration index." << std::endl;
@@ -89,13 +115,20 @@ void editServerConfig(int index, std::vector<ServerConfig>& configs) {
 }
 
 void saveServerConfig(const ServerConfig& config) {
-    std::ofstream outFile("server_config.txt", std::ios::app);  // Open in append mode
-    if (outFile) {
-        outFile << config.name << "," << config.ipAddress << "," << config.port << "\n";
-    } else {
-        std::cerr << "Could not open the config file for writing." << std::endl;
+    std::ofstream outFile("server_configs.txt", std::ios::app);  // Append mode
+    if (outFile.is_open()) {
+        outFile << config.name << "," << config.ipAddress << "," << config.port;
+        for (const auto& channel : config.channels) {
+            outFile << "," << channel.name;  // Save channels
+        }
+        outFile << "\n";
+        outFile.close();
+    }
+    else {
+        std::cerr << "Unable to open file for saving." << std::endl;
     }
 }
+
 
 
 void saveAllServerConfigs(const std::vector<ServerConfig>& configs) {
@@ -113,17 +146,28 @@ void saveAllServerConfigs(const std::vector<ServerConfig>& configs) {
 
 std::vector<ServerConfig> loadServerConfigs() {
     std::vector<ServerConfig> configs;
-    std::ifstream inFile("server_config.txt");
+    std::ifstream inFile(configFileName);
     std::string line;
 
     if (inFile.is_open()) {
         while (getline(inFile, line)) {
             std::istringstream iss(line);
-            std::string name, ip;
-            int port;
-            if (getline(iss, name, ',') && getline(iss, ip, ',') && iss >> port) {
-                configs.push_back({ name, ip, port });
+            ServerConfig config;
+            std::getline(iss, config.name, ',');
+            std::getline(iss, config.ipAddress, ',');
+            iss >> config.port;
+
+            // Assume the rest of the line consists of channel names
+            std::string channelName;
+            while (getline(iss, channelName, ',')) {
+                if (!channelName.empty()) {
+                    Channel channel;
+                    channel.name = channelName;
+                    config.channels.push_back(channel);
+                }
             }
+
+            configs.push_back(config);
         }
         inFile.close();
     }
@@ -166,77 +210,97 @@ std::vector<ServerConfig> listServerConfigs(bool edit) {
     return configs;
 }
 
-void handle_connection(SOCKET sock) {
-    clientMutex.lock();
-    clientSockets.push_back(sock);  // Add new connection to the client list
-    clientMutex.unlock();
+
+void handle_connection(SOCKET sock, ServerConfig& serverConfig) {
+    // Placeholder for receiving the username
+    char nameBuffer[1024];
+    ZeroMemory(nameBuffer, sizeof(nameBuffer));
+    int nameBytesReceived = recv(sock, nameBuffer, sizeof(nameBuffer), 0);
+    std::string clientName(nameBuffer, nameBytesReceived);
+
+    // Join the first channel by default
+    Channel* currentChannel = &serverConfig.channels.front();
+    currentChannel->clients.push_back(sock);
 
     char buffer[1024];
-    std::string clientName;
-
-    // First message received should be the username
-    ZeroMemory(buffer, sizeof(buffer));
-    int bytesReceived = recv(sock, buffer, sizeof(buffer), 0);
-    if (bytesReceived > 0) {
-        clientName = std::string(buffer, 0, bytesReceived);
-        clientMutex.lock();
-        clientNames[sock] = clientName;
-        clientMutex.unlock();
-
-        std::string joinMsg = clientName + " has joined the chat.\n";
-        std::cout << joinMsg;
-        broadcastMessage(joinMsg, sock);
-    }
-    else {
-        std::cout << "Failed to receive username from client." << std::endl;
-        closesocket(sock);
-        return;
-    }
-
     while (true) {
         ZeroMemory(buffer, sizeof(buffer));
-        bytesReceived = recv(sock, buffer, sizeof(buffer), 0);
+        int bytesReceived = recv(sock, buffer, sizeof(buffer), 0);
         if (bytesReceived <= 0) {
-            clientMutex.lock();
-            std::cout << clientName << " disconnected." << std::endl;
-            clientNames.erase(sock);
-            clientMutex.unlock();
-            break;
+            break;  // Client disconnected
         }
 
-        std::string msg = "[" + clientName + "] " + std::string(buffer, 0, bytesReceived);
-        std::cout << msg << std::endl;
-        broadcastMessage(msg, sock);
+        std::string message(buffer, 0, bytesReceived);
+        std::string fullMessage = "[" + clientName + "] " + message;
+
+        // Handle channel switching and broadcasting
+        if (message.substr(0, 6) == "/join ") {
+            std::string newChannelName = message.substr(6);
+            newChannelName.erase(remove_if(newChannelName.begin(), newChannelName.end(), isspace), newChannelName.end());  // Trim whitespace
+
+            bool found = false;
+            for (auto& channel : serverConfig.channels) {
+                if (channel.name == newChannelName) {
+                    // Remove client from the old channel
+                    if (currentChannel) {
+                        currentChannel->clients.erase(
+                            std::remove(currentChannel->clients.begin(), currentChannel->clients.end(), sock),
+                            currentChannel->clients.end()
+                        );
+                    }
+
+                    // Add client to the new channel
+                    currentChannel = &channel;
+                    currentChannel->clients.push_back(sock);
+                    std::string switchMsg = "Switched to channel: " + newChannelName + "\n";
+                    send(sock, switchMsg.c_str(), switchMsg.size(), 0);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                std::string errorMsg = "Channel not found: " + newChannelName + "\n";
+                send(sock, errorMsg.c_str(), errorMsg.size(), 0);
+            }
+        }
+
+        else {
+            for (SOCKET clientSock : currentChannel->clients) {
+                if (clientSock != sock) {  // Do not echo the message back to the sender
+                    send(clientSock, fullMessage.c_str(), fullMessage.length(), 0);
+                }
+            }
+        }
     }
 
-    clientMutex.lock();
-    clientSockets.erase(std::remove(clientSockets.begin(), clientSockets.end(), sock), clientSockets.end());
-    std::string leaveMsg = clientName + " left the chat.\n";
-    std::cout << leaveMsg;
-    broadcastMessage(leaveMsg);
-    clientMutex.unlock();
-
+    // Client disconnects
+    currentChannel->clients.erase(
+        std::remove(currentChannel->clients.begin(), currentChannel->clients.end(), sock),
+        currentChannel->clients.end()
+    );
     closesocket(sock);
 }
 
 
 
-void start_server(int port) {
+void start_server(ServerConfig serverConfig) {
     WSADATA wsData;
     WSAStartup(MAKEWORD(2, 2), &wsData);
 
     std::string serverIP = getLocalIPAddress();
-    std::cout << "Starting server on " << serverIP << ":" << port << std::endl;
+    std::cout << "Starting server on " << serverIP << ":" << serverConfig.port << std::endl;
 
     SOCKET listening = socket(AF_INET, SOCK_STREAM, 0);
 
     sockaddr_in hint;
     hint.sin_family = AF_INET;
-    hint.sin_port = htons(port);
+    hint.sin_port = htons(serverConfig.port);
     hint.sin_addr.S_un.S_addr = INADDR_ANY;
 
     bind(listening, (sockaddr*)&hint, sizeof(hint));
     listen(listening, SOMAXCONN);
+
     while (true) {
         sockaddr_in client;
         int clientSize = sizeof(client);
@@ -247,7 +311,8 @@ void start_server(int port) {
             continue;
         }
 
-        std::thread t(handle_connection, clientSocket);
+        // Pass both the socket and server configuration to the handling thread
+        std::thread t(handle_connection, clientSocket, std::ref(serverConfig));
         t.detach();
     }
 
@@ -314,12 +379,12 @@ int main() {
         std::cin.ignore();
 
         if (mode == "server") {
-            int port;
+            ServerConfig serverConfig;
             std::cout << "Enter port number for the server: ";
-            std::cin >> port;
+            std::cin >> serverConfig.port;
             std::cin.ignore();
 
-            start_server(port);
+            start_server(serverConfig);
         }
         else if (mode == "client") {
             std::cout << "1. Browse servers (not implemented)\n2. Enter server IP\nSelect an option: ";
@@ -348,21 +413,31 @@ int main() {
             }
         }
         else if (mode == "save") {
-            std::string name, ip;
-            int port;
+            ServerConfig newConfig;
             std::cout << "Enter name for the server config: ";
-            std::getline(std::cin, name);
-            std::cout << "IP address: " << getLocalIPAddress() << std::endl;
-            ip = getLocalIPAddress();
+            std::getline(std::cin, newConfig.name);
+            newConfig.ipAddress = getLocalIPAddress();
+            std::cout << "IP address: " << newConfig.ipAddress << std::endl;
             std::cout << "Enter port: ";
-            std::cin >> port;
+            std::cin >> newConfig.port;
             std::cin.ignore();
 
-            ServerConfig newConfig{ name, ip, port };
+            std::cout << "Enter channels (comma-separated, no spaces, e.g., general,tech,support): ";
+            std::string channelsInput;
+            std::getline(std::cin, channelsInput);
+            std::istringstream iss(channelsInput);
+            std::string channelName;
+            while (getline(iss, channelName, ',')) {
+                Channel channel;
+                channel.name = channelName;
+                // Assume that other properties of Channel can be set here as needed
+                newConfig.channels.push_back(channel);
+            }
+
             saveServerConfig(newConfig);
-
-
         }
+
+
         else if (mode == "list") {
             listServerConfigs(true);
         }
@@ -371,15 +446,18 @@ int main() {
             std::cout << "Enter the number of the server config to run: ";
             int choice;
             std::cin >> choice;
+            std::cin.ignore();
+
             if (choice > 0 && choice <= configs.size()) {
                 const auto& config = configs[choice - 1];
                 std::cout << "Running " << config.name << " on " << config.ipAddress << ":" << config.port << std::endl;
-                start_server(config.port);
+                start_server(config);  // Pass the entire config object
             }
             else {
                 std::cerr << "Invalid selection." << std::endl;
             }
         }
+
         else if (mode == "exit") {
             break;
         }
